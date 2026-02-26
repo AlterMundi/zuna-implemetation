@@ -1,0 +1,39 @@
+{
+  "recorder": {
+    "osc_port": 5000,
+    "osc_address": "/muse/eeg",
+    "sampling_rate": 256,
+    "channels": ["TP9", "AF7", "AF8", "TP10"]
+  },
+  "zuna": {
+    "apply_highpass_filter": true,
+    "apply_average_reference": true,
+    "apply_notch_filter": false,
+    "gpu_device": 0,
+    "diffusion_sample_steps": 50,
+    "data_norm": 10.0
+  },
+  "playback": {
+    "actuator_ip": "192.168.1.50",
+    "actuator_port": 53280,
+    "osc_address": "/fnote",
+    "osc_address_rel": "/fnote/rel",
+    "osc_address_panic": "/allnotesoff",
+    "mode": "spectral",
+    "speed": 1.0,
+    "harmonic_multiplier": 32,
+    "velocity_min": 0,
+    "velocity_max": 127,
+    "frequency_min": 20.0,
+    "frequency_max": 2000.0,
+    "epoch_duration": 5.0,
+    "update_rate_hz": 10,
+    "fundamental_hz": 64.0
+  },
+  "muse2_positions": {
+    "TP9":  [-0.0694, -0.0326, -0.0140],
+    "AF7":  [-0.0482,  0.0566,  0.0274],
+    "AF8":  [ 0.0482,  0.0566,  0.0274],
+    "TP10": [ 0.0694, -0.0326, -0.0140]
+  }
+}

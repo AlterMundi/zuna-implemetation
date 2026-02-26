@@ -1,0 +1,31 @@
+# Recordings and processed files
+recordings/
+enhanced/
+working/
+FIGURES/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ZUNA model cache
+*.pt
+*.safetensors
+
+# Environment
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
