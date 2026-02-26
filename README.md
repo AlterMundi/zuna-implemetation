@@ -1,111 +1,103 @@
-# 🧠→🔊 ZUNA EEG-to-Vibration Pipeline
+# 🧠→🔊 EEG-to-Vibration Pipeline
 
-Record brain activity from Muse 2 → enhance with ZUNA AI → play back as vibrations on the harmonic surface.
+Map brain activity to sound and vibration using Muse 2, Surge XT, and the Harmonic Beacon actuator.
+
+## Architecture
 
 ```
-Muse 2 ──OSC──→ osc_recorder.py ──.fif──→ [scp to GPU] ──→ zuna_processor.py
-                                                                    │
-ESP32 Beacon ←──OSC /fnote──← osc_playback.py ←──.fif──← [scp back]
+                         ┌──────────────────────────────────────────────────────┐
+                         │               Use Case 1: Batch (ZUNA)              │
+Muse 2 ──OSC──→ osc_recorder.py ──.fif──→ zuna_processor.py ──→ osc_playback.py ──→ Actuator
+                         │               Use Case 2: Direct                    │
+Muse 2 ──OSC──→ osc_bridge.py ─────────────────────────────────/fnote──→ Actuator
+                         │               Use Case 3: Harmonic Series           │
+Muse 2 ──OSC──→ eeg_harmonic_bridge.py ──→ Surge XT (/fnote + /param)
+                         │                                     └──→ Actuator (HTTP /play)
+                         └──────────────────────────────────────────────────────┘
 ```
 
 ## Quick Start
 
-### 1. Install Dependencies (local machine)
+### Use Case 1: ZUNA-Enhanced Playback (batch)
+Record → denoise with ZUNA on GPU → play back enhanced EEG.
 
 ```bash
-pip install -r requirements.txt
+# 1. Record from Muse 2 (Mind Monitor streaming to port 5000)
+python osc_recorder.py --duration 60
+
+# 2. Transfer to GPU machine, run ZUNA
+scp recordings/*.fif gpu-server:~/eeg/
+ssh gpu-server "python zuna_processor.py --input ~/eeg/recording.fif --output ~/eeg/enhanced/ --gpu"
+scp gpu-server:~/eeg/enhanced/*.fif enhanced/
+
+# 3. Play back to actuator
+python osc_playback.py --input enhanced/recording_eeg.fif --ip 192.168.4.176 --mode spectral
 ```
 
-### 2. Record a Session
-
-Connect Muse 2 via Mind Monitor (OSC target = this machine's IP, port 5000):
+### Use Case 2: Real-Time Direct Bridge
+Live Muse 2 → actuator with no processing. Proof-of-concept.
 
 ```bash
-python osc_recorder.py --duration 300 --output recordings/session_001.fif
+python osc_bridge.py --actuator-ip 192.168.4.176 --mode spectral
 ```
 
-### 3. Process with ZUNA (GPU machine)
-
-Transfer and process:
+### Use Case 3: Harmonic Series Controller ⭐
+Each Muse 2 sensor drives a harmonic voice in the natural series.
 
 ```bash
-# Transfer to GPU machine
-scp recordings/session_001.fif gpu-machine:~/zuna-work/
+# Surge XT only (audio)
+python eeg_harmonic_bridge.py --surge-ip 127.0.0.1
 
-# SSH in and process
-ssh gpu-machine
-pip install zuna  # first time only
-python zuna_processor.py --input ~/zuna-work/session_001.fif \
-                         --output ~/zuna-work/enhanced/ \
-                         --bad-channels TP10 --gpu
+# Actuator only (vibration)
+python eeg_harmonic_bridge.py --actuator-ip 192.168.4.176
 
-# Transfer back
-scp gpu-machine:~/zuna-work/enhanced/session_001.fif enhanced/
+# Both simultaneously (audio + vibration)
+python eeg_harmonic_bridge.py --surge-ip 127.0.0.1 --actuator-ip 192.168.4.176 --stereo
+
+# Test without Muse 2 (simulated brain states)
+python simulate_eeg.py &
+python eeg_harmonic_bridge.py --surge-ip 127.0.0.1
 ```
 
-### 4. Play Back to Harmonic Surface
+**Sensor → Harmonic Mapping (f₁ = 64 Hz):**
 
-Ensure ESP32 Beacon is running `feature/musical-controls` branch:
+| Sensor | Region | Harmonic | Freq | Gain driven by |
+|--------|-----------|----------|------|----------------|
+| TP9    | L temporal| H2       | 128  | theta power    |
+| AF7    | L frontal | H3       | 192  | alpha power    |
+| AF8    | R frontal | H4       | 256  | beta power     |
+| TP10   | R temporal| H5       | 320  | gamma power    |
+| Derived| Coherence | H1       | 64   | cross-corr.    |
 
-```bash
-python osc_playback.py --input enhanced/session_001.fif \
-                       --ip 192.168.1.50 --mode spectral
-```
+**Modulation features:**
+- Filter cutoff: alpha/beta ratio → Surge XT filter (relaxed=warm, focused=bright)
+- Stereo asymmetry: `--stereo` scales L/R harmonic gain by hemisphere dominance
+- Saturation detection: auto-mutes railing sensors (no skin contact)
 
-## Playback Modes
+## Scripts Reference
 
-| Mode | What it does | Best for |
-|------|-------------|----------|
-| `spectral` | Dominant EEG frequency × 32 → vibration frequency | Most organic feel |
-| `band_power` | Strongest EEG band → matching harmonic tine | Feeling state changes |
-| `concentration` | Focus score → vibration intensity on H5 | Simple feedback |
-| `multi_tine` | Brain region → specific harmonic tine | Spatial mapping |
-
-```bash
-python osc_playback.py --input enhanced/session.fif --ip 192.168.1.50 --mode band_power
-python osc_playback.py --input enhanced/session.fif --ip 192.168.1.50 --mode concentration
-python osc_playback.py --input enhanced/session.fif --ip 192.168.1.50 --mode multi_tine
-python osc_playback.py --input enhanced/session.fif --ip 192.168.1.50 --mode spectral --speed 2.0 --loop
-```
-
-## Configuration
-
-Edit `config.json` to change defaults:
-- **recorder**: OSC port, channels, sampling rate
-- **zuna**: filter settings, diffusion steps
-- **playback**: actuator IP/port, mode, harmonic multiplier, velocity range
-- **muse2_positions**: 3D electrode coordinates for .fif montage
-
-## ESP32 Actuator Protocol
-
-The playback script sends to the `feature/musical-controls` branch of [BeaconMagnetActuator](../BeaconMagnetActuator/):
-
-| OSC Address | Args | Description |
-|---|---|---|
-| `/fnote` | freq (Hz), vel (0-127), noteID | Note-on |
-| `/fnote/rel` | freq, vel, noteID | Note-off |
-| `/allnotesoff` | — | Stop all |
-
-Port: `53280` (configurable in ESP32 config.json `osc_port`)
-
-## Project Structure
-
-```
-Zuna-Implementation/
-├── osc_recorder.py      # Stage 1: Muse 2 OSC → .fif
-├── zuna_processor.py    # Stage 2: ZUNA denoise/upsample (GPU machine)
-├── osc_playback.py      # Stage 3: .fif → OSC /fnote → actuator
-├── config.json          # Pipeline configuration
-├── requirements.txt     # Python dependencies
-├── recordings/          # Raw .fif recordings
-└── enhanced/            # ZUNA-processed .fif files
-```
+| Script | Purpose |
+|--------|---------|
+| `osc_recorder.py` | Capture Muse 2 OSC → MNE `.fif` file |
+| `zuna_processor.py` | ZUNA denoise/upsample (GPU machine) |
+| `osc_playback.py` | Play `.fif` → actuator (HTTP + OSC, 4 modes) |
+| `osc_bridge.py` | Live direct bridge: Muse 2 → actuator |
+| `eeg_harmonic_bridge.py` | Harmonic series mapper → Surge XT + actuator |
+| `simulate_eeg.py` | Mock brain activity for testing (7 states) |
+| `generate_mock_eeg.py` | Generate synthetic `.fif` test files |
 
 ## Requirements
 
-- **Local machine**: Python 3.8+, `numpy`, `scipy`, `mne`, `python-osc`
-- **GPU machine**: Above + `zuna` (pip install zuna)
-- **Hardware**: Muse 2 + Mind Monitor, ESP32 Beacon (feature/musical-controls branch)
+```bash
+pip install -r requirements.txt   # mne, python-osc, numpy, scipy
+```
+
+**Surge XT setup:** Enable OSC input in Settings, port 53280.
+
+## Related Projects
+
+- [NaturalHarmony](https://github.com/AlterMundi/NaturalHarmony) — MIDI-to-harmonic-series engine (same OSC protocol)
+- [BeaconMagnetActuator](https://github.com/Pablomonte/BeaconMagnetActuator) — ESP32 harmonic surface firmware
 
 ## License
 

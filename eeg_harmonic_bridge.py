@@ -25,6 +25,8 @@ import signal
 import sys
 import time
 import threading
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
 import numpy as np
@@ -93,6 +95,64 @@ class MultiOscSender:
         return ", ".join(f"{t['name']}={t['ip']}:{t['port']}" for t in self.targets)
 
 
+class HttpActuator:
+    """Sends vibration commands to the ESP32 via HTTP /play (master branch).
+
+    The ESP32's tine layout (from /status):
+      [0]=H6  [1]=H5  [2]=H4  [3]=H3  [4]=H2
+    """
+
+    # Harmonic number → tine index
+    HARMONIC_TO_TINE = {6: 0, 5: 1, 4: 2, 3: 3, 2: 4}
+
+    def __init__(self, ip):
+        self.base_url = f"http://{ip}"
+        self.active_tines = set()
+        self._fetch_layout()
+
+    def _fetch_layout(self):
+        """Fetch tine layout from ESP32."""
+        try:
+            resp = urllib.request.urlopen(f"{self.base_url}/status", timeout=3)
+            status = json.loads(resp.read())
+            tines = status.get("tines", [])
+            # Build harmonic → tine index from live data
+            self.HARMONIC_TO_TINE = {}
+            for i, t in enumerate(tines):
+                self.HARMONIC_TO_TINE[t["harmonic"]] = i
+            print(f"  ESP32 connected: {len(tines)} tines")
+            for i, t in enumerate(tines):
+                print(f"    [{i}] {t['name']}: {t['freq']} Hz")
+        except Exception as e:
+            print(f"  WARNING: Could not reach ESP32 ({e}), using default layout")
+
+    def play(self, harmonic_n, velocity_0_127, duration_ms=3000):
+        """Play a tine by harmonic number. Vel 0-127 → 0-255."""
+        tine_idx = self.HARMONIC_TO_TINE.get(harmonic_n)
+        if tine_idx is None:
+            return  # no tine for this harmonic
+        vel = int(min(255, velocity_0_127 * 2))  # scale to 0-255
+        params = urllib.parse.urlencode({"tine": tine_idx, "vel": vel, "dur": duration_ms})
+        try:
+            req = urllib.request.Request(f"{self.base_url}/play?{params}", method="POST")
+            urllib.request.urlopen(req, timeout=1)
+            self.active_tines.add(tine_idx)
+        except Exception:
+            pass
+
+    def stop(self):
+        """Stop all tines."""
+        try:
+            req = urllib.request.Request(f"{self.base_url}/stop", method="POST")
+            urllib.request.urlopen(req, timeout=1)
+            self.active_tines.clear()
+        except Exception:
+            pass
+
+    def describe(self):
+        return f"ESP32(HTTP)={self.base_url}"
+
+
 # ─────────────────────────────────────────────
 # EEG Harmonic Bridge
 # ─────────────────────────────────────────────
@@ -100,9 +160,10 @@ class MultiOscSender:
 class EEGHarmonicBridge:
     """Maps Muse 2 EEG sensors to natural harmonic series voices."""
 
-    def __init__(self, osc_sender, f1, update_rate, stereo=False,
+    def __init__(self, osc_sender, http_actuator, f1, update_rate, stereo=False,
                  window_seconds=1.0):
-        self.sender = osc_sender
+        self.sender = osc_sender       # OSC → Surge XT
+        self.actuator = http_actuator  # HTTP → ESP32 (can be None)
         self.f1 = f1
         self.stereo = stereo
         self.update_interval = 1.0 / update_rate
@@ -312,6 +373,10 @@ class EEGHarmonicBridge:
 
             if velocity > 0:
                 self.sender.send("/fnote", [float(freq), float(velocity), float(voice_id)])
+                # Also send to ESP32 via HTTP
+                if self.actuator:
+                    dur_ms = int(self.update_interval * 1500)  # slightly longer than update
+                    self.actuator.play(harmonic_n, velocity, dur_ms)
                 self.voice_active[harmonic_n] = True
             else:
                 self.voice_active[harmonic_n] = False
@@ -355,6 +420,8 @@ class EEGHarmonicBridge:
 
     def panic(self):
         self.sender.send("/allnotesoff", [])
+        if self.actuator:
+            self.actuator.stop()
         for n in self.voice_active:
             self.voice_active[n] = False
 
@@ -443,16 +510,21 @@ def main():
         print("ERROR: Specify at least one target: --surge-ip and/or --actuator-ip")
         sys.exit(1)
 
-    # Build sender
+    # Build OSC sender (for Surge XT)
     sender = MultiOscSender()
     if args.surge_ip:
         sender.add_target("Surge XT", args.surge_ip, args.surge_port)
+
+    # Build HTTP actuator (for ESP32)
+    http_actuator = None
     if args.actuator_ip:
-        sender.add_target("ESP32", args.actuator_ip, args.actuator_port)
+        print(f"\n  Connecting to ESP32 at {args.actuator_ip}...")
+        http_actuator = HttpActuator(args.actuator_ip)
 
     # Bridge
     bridge = EEGHarmonicBridge(
         osc_sender=sender,
+        http_actuator=http_actuator,
         f1=args.f1,
         update_rate=args.update_rate,
         stereo=stereo,
@@ -475,11 +547,16 @@ def main():
 
     # Banner
     mode_label = "STEREO" if stereo else "MONO"
+    targets = []
+    if args.surge_ip:
+        targets.append(f"Surge XT (OSC) @ {args.surge_ip}:{args.surge_port}")
+    if http_actuator:
+        targets.append(http_actuator.describe())
     print(f"\n{'='*65}")
     print(f"  🧠 EEG Harmonic Bridge — Natural Harmonic Series [{mode_label}]")
     print(f"{'='*65}")
     print(f"  IN:      /muse/eeg @ 0.0.0.0:{args.listen_port}")
-    print(f"  OUT:     {sender.describe()}")
+    print(f"  OUT:     {', '.join(targets)}")
     print(f"  f₁:      {args.f1} Hz")
     print(f"  Rate:    {args.update_rate} Hz")
     print(f"  Mapping:")
