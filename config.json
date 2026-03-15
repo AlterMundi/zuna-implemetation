@@ -30,6 +30,16 @@
     "update_rate_hz": 10,
     "fundamental_hz": 64.0
   },
+  "muse_bridge": {
+    "shaper_ip": "127.0.0.1",
+    "shaper_port": 9002,
+    "shaper_api": "http://127.0.0.1:8080",
+    "default_depth": 0.20,
+    "smoothing_alpha": 0.25,
+    "update_rate_hz": 4,
+    "window_seconds": 1.0,
+    "tilt_weights": [-0.8, -0.4, 0.0, 0.4, 0.8]
+  },
   "muse2_positions": {
     "TP9":  [-0.0694, -0.0326, -0.0140],
     "AF7":  [-0.0482,  0.0566,  0.0274],
