@@ -13,6 +13,8 @@ Two parameter modes (--param):
            the rotation speed of its matched harmonic's phase.
            Stronger brain activity = faster phase drift.
            H1 stays anchored. The cymatic pattern evolves continuously.
+           Phase output is interpolated at --osc-rate (default 30 Hz) for
+           smooth, jitter-free cymatic movement between EEG analysis ticks.
 
 Base values are fetched from harmonic_shaper's HTTP API on startup.
 On exit, base values are restored.
@@ -20,7 +22,7 @@ On exit, base values are restored.
 Usage:
     python muse_bridge.py --param gain --shaper-ip 127.0.0.1
     python muse_bridge.py --param phase --shaper-ip 127.0.0.1 --depth 30
-    python muse_bridge.py --param phase --depth 45 --update-rate 8
+    python muse_bridge.py --param phase --depth 45 --osc-rate 60
 
 Test with the EEG simulator (no Muse 2 needed):
     python simulate_eeg.py &
@@ -102,12 +104,15 @@ class MuseBridge:
     """Modulates harmonic_shaper parameters from Muse 2 EEG."""
 
     def __init__(self, osc_out, shaper_api, param_mode, depth, update_rate,
-                 window_seconds=1.0, smoothing_alpha=0.25):
+                 osc_rate=30.0, window_seconds=1.0, smoothing_alpha=0.25):
         self.osc_out = osc_out
         self.shaper_api = shaper_api
         self.param_mode = param_mode
         self.depth = depth
+        self.update_rate = update_rate
         self.update_interval = 1.0 / update_rate
+        self.osc_rate = osc_rate
+        self.osc_interval = 1.0 / osc_rate
         self.smoothing_alpha = smoothing_alpha
         self.window_size = int(window_seconds * SAMPLING_RATE)
 
@@ -137,6 +142,7 @@ class MuseBridge:
 
         self._lock = threading.Lock()
         self.updates_sent = 0
+        self.osc_sends = 0
 
     # ─── Base Value Management ───
 
@@ -262,48 +268,45 @@ class MuseBridge:
 
     # ─── Phase Rotation Mode ───
 
-    def compute_phase_rotation(self):
-        """Per-band rotation: band power controls phase velocity per harmonic.
+    def analyze_phase_velocities(self):
+        """EEG analysis step (slow, runs at update_rate).
 
-        depth = max degrees per second (e.g. 30 means 0-30 deg/s)
-        H1 stays anchored at base phase.
-        H2-H5 rotate based on their matched sensor's band power.
+        Reads band power from each sensor and updates the target velocity
+        for each harmonic. Does NOT advance accumulators — that happens in
+        the fast output tick.
         """
-        phases = {}
-        dt = self.update_interval
-
-        # H1: anchored at base phase
-        h1_base = self.base_phases.get(1, 0.0)
-        phases[1] = h1_base
-
         for n, cfg in PHASE_SENSOR_MAP.items():
             ch = cfg["channel"]
             band = cfg["band"]
 
             if not self._channel_ok(ch):
-                # No contact: hold current position
-                phases[n] = (self.base_phases.get(n, 0.0) + self.phase_accumulators[n]) % 360
-                self.phase_velocities[n] = 0.0
+                self.phase_velocities[n] *= (1.0 - self.smoothing_alpha)
                 continue
 
             power = self._get_band_power(ch, band)
             p_low, p_high = self._update_power_range(ch, power)
 
-            # Normalize power to 0-1
             if p_high > p_low:
                 normalized = (power - p_low) / (p_high - p_low)
             else:
                 normalized = 0.0
             normalized = float(np.clip(normalized, 0.0, 1.0))
 
-            # Velocity in degrees/second, smoothed
             target_velocity = normalized * self.depth
             self.phase_velocities[n] += (target_velocity - self.phase_velocities[n]) * self.smoothing_alpha
 
-            # Accumulate phase
+    def advance_phases(self, dt):
+        """Output step (fast, runs at osc_rate).
+
+        Advances accumulators using the current velocities and returns
+        the absolute phase for each harmonic.
+        """
+        phases = {}
+        phases[1] = self.base_phases.get(1, 0.0)
+
+        for n in PHASE_SENSOR_MAP:
             self.phase_accumulators[n] += self.phase_velocities[n] * dt
             self.phase_accumulators[n] %= 360
-
             base = self.base_phases.get(n, 0.0)
             phases[n] = (base + self.phase_accumulators[n]) % 360
 
@@ -330,25 +333,33 @@ class MuseBridge:
 
     # ─── Main Update ───
 
-    def update(self):
+    def update_gain(self):
+        """Full gain update: analyze + send (runs at update_rate)."""
         if self.samples_received < self.window_size // 2:
             return None
+        if not self._has_good_frontal():
+            return {"status": "no_signal"}
+        gains = self.compute_gain_modulation()
+        self.send_gains(gains)
+        self.updates_sent += 1
+        return {"tilt": self.tilt_smooth, "gains": gains}
 
-        if self.param_mode == "gain":
-            if not self._has_good_frontal():
-                return {"status": "no_signal"}
-            gains = self.compute_gain_modulation()
-            self.send_gains(gains)
-            self.updates_sent += 1
-            return {"tilt": self.tilt_smooth, "gains": gains}
+    def update_phase_analysis(self):
+        """Phase analysis only: update velocities from EEG (runs at update_rate)."""
+        if self.samples_received < self.window_size // 2:
+            return None
+        if not self._has_any_good_channel():
+            return {"status": "no_signal"}
+        self.analyze_phase_velocities()
+        self.updates_sent += 1
+        return "ok"
 
-        else:  # phase
-            if not self._has_any_good_channel():
-                return {"status": "no_signal"}
-            phases = self.compute_phase_rotation()
-            self.send_phases(phases)
-            self.updates_sent += 1
-            return {"phases": phases, "velocities": dict(self.phase_velocities)}
+    def tick_phase_output(self, dt):
+        """Advance phase accumulators and send (runs at osc_rate)."""
+        phases = self.advance_phases(dt)
+        self.send_phases(phases)
+        self.osc_sends += 1
+        return {"phases": phases, "velocities": dict(self.phase_velocities)}
 
     # ─── Display ───
 
@@ -425,11 +436,55 @@ class MuseBridge:
     # ─── Loop ───
 
     def run_loop(self):
+        if self.param_mode == "gain":
+            self._run_gain_loop()
+        else:
+            self._run_phase_loop()
+
+    def _run_gain_loop(self):
+        """Gain mode: single-rate loop at update_rate."""
         while self.running:
-            result = self.update()
+            result = self.update_gain()
             status = self.format_status(result)
             print(f"\r{status}  [{self.updates_sent}]", end="", flush=True)
             time.sleep(self.update_interval)
+
+    def _run_phase_loop(self):
+        """Phase mode: dual-rate loop.
+
+        Outer clock runs at osc_rate (30 Hz default) for smooth phase
+        interpolation. EEG analysis runs every analysis_every ticks
+        (update_rate / osc_rate ratio).
+        """
+        ticks_per_analysis = max(1, int(round(self.osc_rate / self.update_rate)))
+        display_every = max(1, int(round(self.osc_rate / 4.0)))
+        tick = 0
+        last_result = None
+
+        while self.running:
+            t0 = time.monotonic()
+
+            if tick % ticks_per_analysis == 0:
+                analysis = self.update_phase_analysis()
+                if analysis == "ok" or (last_result and last_result.get("phases")):
+                    phase_result = self.tick_phase_output(self.osc_interval)
+                    last_result = phase_result
+                elif analysis and analysis.get("status") == "no_signal":
+                    last_result = analysis
+            else:
+                if last_result and last_result.get("phases"):
+                    phase_result = self.tick_phase_output(self.osc_interval)
+                    last_result = phase_result
+
+            if tick % display_every == 0:
+                status = self.format_status(last_result)
+                print(f"\r{status}  [a:{self.updates_sent} o:{self.osc_sends}]", end="", flush=True)
+
+            tick += 1
+            elapsed = time.monotonic() - t0
+            sleep_for = self.osc_interval - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
 
 # ─────────────────────────────────────────────
@@ -456,7 +511,10 @@ def main():
                         help="Modulation depth: gain=fraction (0.20=+/-20%%), phase=max deg/s (default: gain=0.20, phase=30)")
     parser.add_argument("--update-rate", type=float,
                         default=MB.get("update_rate_hz", 4.0),
-                        help="Updates per second (default: 4 Hz)")
+                        help="EEG analysis rate in Hz (default: 4)")
+    parser.add_argument("--osc-rate", type=float,
+                        default=MB.get("osc_rate_hz", 30.0),
+                        help="Phase OSC output rate in Hz for smooth interpolation (default: 30)")
     parser.add_argument("--window", type=float,
                         default=MB.get("window_seconds", 1.0),
                         help="EEG analysis window in seconds (default: 1.0)")
@@ -479,6 +537,7 @@ def main():
         param_mode=args.param,
         depth=args.depth,
         update_rate=args.update_rate,
+        osc_rate=args.osc_rate,
         window_seconds=args.window,
         smoothing_alpha=args.smoothing,
     )
@@ -532,7 +591,9 @@ def main():
     print(f"  OUT:      /shaper/harmonic/N/{param_path} @ {args.shaper_ip}:{args.shaper_port}")
     print(f"  API:      {args.shaper_api}")
     print(f"  Depth:    {depth_label}")
-    print(f"  Rate:     {args.update_rate} Hz")
+    print(f"  EEG rate: {args.update_rate} Hz (analysis)")
+    if args.param == "phase":
+        print(f"  OSC rate: {args.osc_rate} Hz (interpolated output)")
     print(f"  Window:   {args.window}s ({int(args.window * SAMPLING_RATE)} samples)")
     print(f"  Smooth:   alpha={args.smoothing}")
     print(f"")

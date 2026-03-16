@@ -37,6 +37,7 @@
     "default_depth": 0.20,
     "smoothing_alpha": 0.25,
     "update_rate_hz": 4,
+    "osc_rate_hz": 30,
     "window_seconds": 1.0,
     "tilt_weights": [-0.8, -0.4, 0.0, 0.4, 0.8]
   },
