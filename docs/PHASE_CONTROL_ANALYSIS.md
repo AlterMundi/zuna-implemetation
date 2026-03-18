@@ -21,13 +21,16 @@ Muse 2 headband                    Launchpad Mini
        |                                  |
   OSC /muse/eeg :5000              harmonic_beacon
        |                           (MIDI -> OSC)
-       |                                  |
        v                                  |
-  muse_bridge.py                          |
-  (EEG analysis)                          |
+  muse_bridge.py ←──── hr_relay.py        |
+  (EEG analysis +      (heartbeat)        |
+   phase interp +                         |
+   gain pulse)     midi_relay.py          |
+       |           (Launchpad slider)     |
        |                                  |
        |  /shaper/harmonic/N/phase        |  /beacon/voice/on,off
-       |  OSC :9002                       |  OSC :9001
+       |  /shaper/harmonic/N/gain         |  OSC :9001
+       |  OSC :9002                       |
        |                                  |
        +----------> harmonic_shaper <-----+
                     (additive synth)
@@ -48,7 +51,9 @@ Muse 2 headband                    Launchpad Mini
 The harmonic_shaper synthesizes pure sine waves. The Launchpad selects *which*
 harmonics play (and at what frequency). The Muse controls *how those harmonics
 relate to each other in phase* — which is what determines the shape of the
-interference pattern.
+interference pattern. Optionally, a Fitbit heartbeat can overlay a rhythmic
+gain pulse and a Launchpad slider can control EEG gain depth — see
+[SESSION_GUIDE.md](SESSION_GUIDE.md) for all combinations.
 
 ---
 
@@ -176,7 +181,7 @@ phase jumps.
 The velocity is integrated over time to produce a continuously advancing phase:
 
 ```
-phase_accumulator += velocity * dt      (where dt = 1/update_rate = 0.25s)
+phase_accumulator += velocity * dt
 phase_accumulator %= 360                (wrap around)
 
 effective_phase = base_phase + phase_accumulator
@@ -201,6 +206,60 @@ At half power: 24 seconds. At low power: it barely moves.
 
 With `depth=45`: full cycle in 8 seconds at max power.
 With `depth=15`: full cycle in 24 seconds at max power.
+
+---
+
+## Phase Interpolation: The Dual-Rate Loop
+
+### The Problem
+
+EEG analysis is computationally expensive (Welch PSD on 256-sample windows)
+and the Muse 2 only provides 256 samples/second, so analysis runs at 4 Hz
+(every 250 ms). If phase output also runs at 4 Hz, the cymatic pattern
+updates in visible jumps — a 15 deg/s rotation sends 3.75-degree steps
+every 250 ms, which looks "jumpy" on the cymatic mirror.
+
+### The Solution: Split Analysis and Output
+
+The bridge runs two clocks:
+
+| Clock | Rate | What it does |
+|-------|------|--------------|
+| **Analysis** (slow) | 4 Hz | Reads EEG, computes band power, updates target velocity (EMA-smoothed) |
+| **Output** (fast) | 30 Hz (default) | Advances phase accumulators by `velocity * dt` and sends OSC |
+
+```
+Analysis tick (4 Hz):                Output tick (30 Hz):
+  EEG window → PSD →                  accumulator += velocity × (1/30)
+  band power → normalize →            accumulator %= 360
+  target velocity →                   phase = base + accumulator
+  EMA smooth → velocity               OSC send → shaper
+```
+
+At 30 Hz, a 15 deg/s rotation sends 0.5-degree steps every 33 ms — below
+the threshold of visual perception. The cymatic pattern moves fluidly.
+
+### dt and Phase Resolution
+
+The `dt` in the output tick is `1 / osc_rate`:
+
+| osc_rate | dt | Step at 15 deg/s | Step at 30 deg/s |
+|----------|------|-------------------|-------------------|
+| 4 Hz | 250 ms | 3.75 degrees | 7.5 degrees |
+| **30 Hz** | **33 ms** | **0.5 degrees** | **1.0 degrees** |
+| 60 Hz | 17 ms | 0.25 degrees | 0.5 degrees |
+
+The default 30 Hz is chosen as a balance between smoothness and OSC traffic.
+Tune with `--osc-rate` if needed. The EEG analysis rate (`--update-rate`)
+is independent.
+
+### Implementation Detail
+
+The output tick calls `advance_phases(dt)` which reads the **current
+velocity** (as set by the last analysis tick) and accumulates. Between
+analysis ticks, velocity stays constant, producing linear interpolation.
+When the next analysis tick updates velocity (via EMA smoothing), the
+change is gradual — there is no discontinuity.
 
 ---
 
@@ -404,13 +463,15 @@ the shaper from being left in a random phase state.
 |----------|---------|-------------|
 | `--param phase` | phase | Select phase rotation mode |
 | `--depth 30` | 30.0 | Maximum rotation speed in degrees/second |
-| `--update-rate 4` | 4.0 | Analysis updates per second (Hz) |
+| `--update-rate 4` | 4.0 | EEG analysis rate in Hz (slow clock) |
+| `--osc-rate 30` | 30.0 | Phase output rate in Hz (fast clock, for interpolation) |
 | `--window 1.0` | 1.0 | EEG analysis window in seconds |
 | `--smoothing 0.25` | 0.25 | EMA smoothing factor (0 = no smoothing, 1 = no filtering) |
+| `--pulse 0.15` | 0.15 | Heartbeat gain pulse amplitude (0 = disabled) |
 | `--shaper-ip` | 127.0.0.1 | Harmonic shaper IP address |
 | `--shaper-port` | 9002 | Shaper OSC control port |
 | `--shaper-api` | http://127.0.0.1:8080 | Shaper HTTP API for base value fetch |
-| `--listen-port` | 5000 | Port for incoming Muse 2 OSC |
+| `--listen-port` | 5000 | Port for incoming Muse 2 OSC and /bridge/* control |
 
 ### config.json
 
@@ -422,6 +483,7 @@ the shaper from being left in a random phase state.
     "default_depth": 0.20,
     "smoothing_alpha": 0.25,
     "update_rate_hz": 4,
+    "osc_rate_hz": 30,
     "window_seconds": 1.0,
     "tilt_weights": [-0.8, -0.4, 0.0, 0.4, 0.8]
 }
@@ -431,11 +493,11 @@ the shaper from being left in a random phase state.
 
 | Address | Payload | Range | Rate |
 |---------|---------|-------|------|
-| `/shaper/harmonic/1/phase` | `[degrees]` | Always base phase (anchored) | 4 Hz |
-| `/shaper/harmonic/2/phase` | `[degrees]` | 0 -- 360, wrapping | 4 Hz |
-| `/shaper/harmonic/3/phase` | `[degrees]` | 0 -- 360, wrapping | 4 Hz |
-| `/shaper/harmonic/4/phase` | `[degrees]` | 0 -- 360, wrapping | 4 Hz |
-| `/shaper/harmonic/5/phase` | `[degrees]` | 0 -- 360, wrapping | 4 Hz |
+| `/shaper/harmonic/1/phase` | `[degrees]` | Always base phase (anchored) | 30 Hz |
+| `/shaper/harmonic/2/phase` | `[degrees]` | 0 -- 360, wrapping | 30 Hz |
+| `/shaper/harmonic/3/phase` | `[degrees]` | 0 -- 360, wrapping | 30 Hz |
+| `/shaper/harmonic/4/phase` | `[degrees]` | 0 -- 360, wrapping | 30 Hz |
+| `/shaper/harmonic/5/phase` | `[degrees]` | 0 -- 360, wrapping | 30 Hz |
 
 ### Depth Tuning Guide
 
@@ -450,7 +512,7 @@ the shaper from being left in a random phase state.
 
 ---
 
-## Complete Data Flow (per update tick)
+## Complete Data Flow
 
 ```
 1. OSC /muse/eeg arrives (256 Hz, 4 floats)
@@ -462,7 +524,7 @@ the shaper from being left in a random phase state.
    buffers["AF8"][write_pos] = value[2]
    buffers["TP10"][write_pos] = value[3]
          |
-         v  (every 250ms at 4 Hz update rate)
+         v  [SLOW CLOCK: every 250ms at 4 Hz analysis rate]
 3. Extract 1-second window per channel
          |
          v
@@ -482,8 +544,9 @@ the shaper from being left in a random phase state.
          v
 7. EMA smoothing: velocity += (target - velocity) × 0.25
          |
+         |  [FAST CLOCK: every 33ms at 30 Hz output rate]
          v
-8. Phase accumulation: accumulator += velocity × dt
+8. Phase accumulation: accumulator += velocity × (1/30)
    accumulator %= 360
          |
          v
@@ -491,15 +554,20 @@ the shaper from being left in a random phase state.
          |
          v
 10. OSC send: /shaper/harmonic/N/phase → harmonic_shaper :9002
-         |
-         v
+          |
+          v
 11. VoiceParameterStore.set_phase(n, degrees)
     → stores as radians internally
-         |
-         v
+          |
+          v
 12. Audio callback reads phase (next ~5.8ms block)
     sine = sin(2π × freq × t + carrier_phase + phase_offset) × gain
-         |
-         v
+          |
+          v
 13. Stereo mix → speakers → tube → balloon → mirror → laser → wall
 ```
+
+Steps 1-7 run on the **slow clock** (4 Hz). Steps 8-10 run on the
+**fast clock** (30 Hz), reading the most recent velocity from step 7.
+This dual-rate design produces smooth, jitter-free cymatic movement
+while keeping EEG computation efficient.
