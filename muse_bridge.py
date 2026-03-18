@@ -4,7 +4,7 @@ Muse Bridge — EEG-driven parameter modulation for the Harmonic Shaper
 Reads live Muse 2 EEG via OSC and modulates harmonic_shaper parameters
 within bounded limits around the user-set base values.
 
-Two parameter modes (--param):
+Three parameter modes (--param):
 
   gain   — Spectral tilt: alpha/beta ratio tilts the gain curve.
            Relaxation boosts lower harmonics, focus boosts upper.
@@ -16,17 +16,27 @@ Two parameter modes (--param):
            Phase output is interpolated at --osc-rate (default 30 Hz) for
            smooth, jitter-free cymatic movement between EEG analysis ticks.
 
+  both   — Phase rotation + gain tilt simultaneously.
+           Gain depth is controlled by an external slider via
+           /bridge/gain_depth OSC (e.g. Launchpad mod wheel through
+           midi_relay.py). Slider at 0 = no gain modulation.
+           Slider at max = full EEG influence on gains.
+
 Base values are fetched from harmonic_shaper's HTTP API on startup.
 On exit, base values are restored.
 
 Usage:
-    python muse_bridge.py --param gain --shaper-ip 127.0.0.1
-    python muse_bridge.py --param phase --shaper-ip 127.0.0.1 --depth 30
-    python muse_bridge.py --param phase --depth 45 --osc-rate 60
+    python muse_bridge.py --param gain --depth 0.20
+    python muse_bridge.py --param phase --depth 30 --osc-rate 60
+    python muse_bridge.py --param both --depth 30
+    python muse_bridge.py --param both --depth 30 --gain-depth 0.20
+
+    # With Launchpad slider control (run alongside):
+    python midi_relay.py --target-port 5000
 
 Test with the EEG simulator (no Muse 2 needed):
     python simulate_eeg.py &
-    python muse_bridge.py --param phase --shaper-ip 127.0.0.1
+    python muse_bridge.py --param both
 """
 
 import argparse
@@ -103,12 +113,14 @@ def fetch_shaper_state(api_base):
 class MuseBridge:
     """Modulates harmonic_shaper parameters from Muse 2 EEG."""
 
-    def __init__(self, osc_out, shaper_api, param_mode, depth, update_rate,
-                 osc_rate=30.0, window_seconds=1.0, smoothing_alpha=0.25):
+    def __init__(self, osc_out, shaper_api, param_mode, phase_depth, gain_depth,
+                 update_rate, osc_rate=30.0, window_seconds=1.0,
+                 smoothing_alpha=0.25):
         self.osc_out = osc_out
         self.shaper_api = shaper_api
         self.param_mode = param_mode
-        self.depth = depth
+        self.phase_depth = phase_depth   # max deg/s for phase rotation
+        self.gain_depth = gain_depth     # fraction for gain tilt (0-1)
         self.update_rate = update_rate
         self.update_interval = 1.0 / update_rate
         self.osc_rate = osc_rate
@@ -157,9 +169,9 @@ class MuseBridge:
         if phases:
             self.base_phases = phases
 
-        if self.param_mode == "gain":
+        if self.param_mode in ("gain", "both"):
             print(f"  Base gains:  {self._format_gains()}")
-        else:
+        if self.param_mode in ("phase", "both"):
             print(f"  Base phases: {self._format_phases()}")
 
     def _format_gains(self):
@@ -191,6 +203,18 @@ class MuseBridge:
             for i, ch in enumerate(CHANNELS):
                 if i < len(args):
                     self.contact_quality[ch] = float(args[i])
+
+    def gain_depth_handler(self, address, *args):
+        """Receive live gain depth from external controller (e.g. Launchpad slider).
+
+        Accepts 0-127 (MIDI range, auto-normalized) or 0.0-1.0.
+        """
+        if not args:
+            return
+        raw = float(args[0])
+        if raw > 1.0:
+            raw = raw / 127.0
+        self.gain_depth = max(0.0, min(1.0, raw))
 
     # ─── Analysis Helpers ───
 
@@ -262,7 +286,7 @@ class MuseBridge:
             w = weights[i] if i < len(weights) else 0.0
             modulator = float(np.clip(self.tilt_smooth * w, -1.0, 1.0))
             base = self.base_gains.get(n, 0.8)
-            effective = base * (1.0 + self.depth * modulator)
+            effective = base * (1.0 + self.gain_depth * modulator)
             gains[n] = float(np.clip(effective, 0.0, 1.0))
         return gains
 
@@ -292,7 +316,7 @@ class MuseBridge:
                 normalized = 0.0
             normalized = float(np.clip(normalized, 0.0, 1.0))
 
-            target_velocity = normalized * self.depth
+            target_velocity = normalized * self.phase_depth
             self.phase_velocities[n] += (target_velocity - self.phase_velocities[n]) * self.smoothing_alpha
 
     def advance_phases(self, dt):
@@ -326,9 +350,9 @@ class MuseBridge:
 
     def restore_base(self):
         """Restore base values before exiting."""
-        if self.param_mode == "gain":
+        if self.param_mode in ("gain", "both"):
             self.send_gains(self.base_gains)
-        else:
+        if self.param_mode in ("phase", "both"):
             self.send_phases(self.base_phases)
 
     # ─── Main Update ───
@@ -374,7 +398,9 @@ class MuseBridge:
 
         if self.param_mode == "gain":
             return self._format_gain_status(result)
-        return self._format_phase_status(result)
+        if self.param_mode == "phase":
+            return self._format_phase_status(result)
+        return self._format_both_status(result)
 
     def _format_gain_status(self, result):
         tilt = result.get("tilt", 0.0)
@@ -433,13 +459,49 @@ class MuseBridge:
 
         return "  " + "  ".join(parts)
 
+    def _format_both_status(self, result):
+        phases = result.get("phases", {})
+        velocities = result.get("velocities", {})
+        tilt = result.get("tilt", 0.0)
+        gains = result.get("gains", {})
+
+        # Compact phase display
+        ph_parts = []
+        for n in sorted(phases.keys()):
+            vel = velocities.get(n, 0.0)
+            if n == 1:
+                ph_parts.append(f"H1\u2693")
+            else:
+                ph_parts.append(f"H{n} {phases[n]:5.1f}\u00b0 {vel:4.1f}\u00b0/s")
+        phase_str = " ".join(ph_parts)
+
+        # Compact gain display
+        if self.gain_depth < 0.001:
+            gain_str = f"slider=0%"
+        else:
+            if tilt > 0.1:
+                tilt_icon = "<<<RELAX"
+            elif tilt < -0.1:
+                tilt_icon = "FOCUS>>>"
+            else:
+                tilt_icon = "neutral"
+            pct = int(self.gain_depth * 100)
+            gain_str = f"slider={pct}% {tilt_icon}"
+            if gains:
+                g_parts = [f"H{n}={g:.2f}" for n, g in sorted(gains.items())]
+                gain_str += " " + " ".join(g_parts)
+
+        return f"  {phase_str} | {gain_str}"
+
     # ─── Loop ───
 
     def run_loop(self):
         if self.param_mode == "gain":
             self._run_gain_loop()
-        else:
+        elif self.param_mode == "phase":
             self._run_phase_loop()
+        else:
+            self._run_both_loop()
 
     def _run_gain_loop(self):
         """Gain mode: single-rate loop at update_rate."""
@@ -486,6 +548,55 @@ class MuseBridge:
             if sleep_for > 0:
                 time.sleep(sleep_for)
 
+    def _run_both_loop(self):
+        """Combined mode: phase rotation (interpolated) + gain tilt (on analysis ticks).
+
+        Gain depth is dynamic — controlled by /bridge/gain_depth OSC from
+        the Launchpad slider via midi_relay.py.
+        """
+        ticks_per_analysis = max(1, int(round(self.osc_rate / self.update_rate)))
+        display_every = max(1, int(round(self.osc_rate / 4.0)))
+        tick = 0
+        last_result = None
+        phase_active = False
+
+        while self.running:
+            t0 = time.monotonic()
+            buffering = self.samples_received < self.window_size // 2
+
+            if tick % ticks_per_analysis == 0 and not buffering:
+                # Analysis tick: update phase velocities + gain tilt
+                if self._has_any_good_channel():
+                    self.analyze_phase_velocities()
+                    phase_active = True
+                    self.updates_sent += 1
+
+                if self.gain_depth > 0.001 and self._has_good_frontal():
+                    gains = self.compute_gain_modulation()
+                    self.send_gains(gains)
+                    if last_result is None:
+                        last_result = {}
+                    last_result["tilt"] = self.tilt_smooth
+                    last_result["gains"] = gains
+
+            # Phase output tick (fast, every iteration)
+            if phase_active:
+                phase_result = self.tick_phase_output(self.osc_interval)
+                if last_result is None:
+                    last_result = {}
+                last_result["phases"] = phase_result["phases"]
+                last_result["velocities"] = phase_result["velocities"]
+
+            if tick % display_every == 0:
+                status = self.format_status(last_result)
+                print(f"\r{status}  [a:{self.updates_sent} o:{self.osc_sends}]", end="", flush=True)
+
+            tick += 1
+            elapsed = time.monotonic() - t0
+            sleep_for = self.osc_interval - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
 
 # ─────────────────────────────────────────────
 # Main
@@ -495,8 +606,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Muse Bridge — EEG parameter modulation for Harmonic Shaper"
     )
-    parser.add_argument("--param", choices=["gain", "phase"], default="phase",
-                        help="Which shaper parameter to modulate (default: phase)")
+    parser.add_argument("--param", choices=["gain", "phase", "both"], default="both",
+                        help="Which shaper parameter to modulate (default: both)")
     parser.add_argument("--shaper-ip", default=MB.get("shaper_ip", "127.0.0.1"),
                         help="Harmonic Shaper IP (default: 127.0.0.1)")
     parser.add_argument("--shaper-port", type=int,
@@ -506,9 +617,11 @@ def main():
                         help="Shaper HTTP API base URL (default: http://127.0.0.1:8080)")
     parser.add_argument("--listen-port", type=int,
                         default=REC.get("osc_port", 5000),
-                        help="Port to listen for Muse 2 OSC (default: 5000)")
+                        help="Port to listen for Muse 2 OSC and /bridge/* control (default: 5000)")
     parser.add_argument("--depth", type=float, default=None,
-                        help="Modulation depth: gain=fraction (0.20=+/-20%%), phase=max deg/s (default: gain=0.20, phase=30)")
+                        help="Phase max deg/s, or gain fraction in gain-only mode (default: gain=0.20, phase/both=30)")
+    parser.add_argument("--gain-depth", type=float, default=None,
+                        help="Initial gain modulation depth 0-1 (default: 0.20 for gain, 0 for both — slider takes over)")
     parser.add_argument("--update-rate", type=float,
                         default=MB.get("update_rate_hz", 4.0),
                         help="EEG analysis rate in Hz (default: 4)")
@@ -523,9 +636,16 @@ def main():
                         help="EMA smoothing factor 0-1 (default: 0.25)")
     args = parser.parse_args()
 
-    # Default depth depends on param mode
-    if args.depth is None:
-        args.depth = 0.20 if args.param == "gain" else 30.0
+    # Resolve depths per mode
+    if args.param == "gain":
+        phase_depth = 0.0
+        gain_depth = args.gain_depth if args.gain_depth is not None else (args.depth if args.depth is not None else 0.20)
+    elif args.param == "phase":
+        phase_depth = args.depth if args.depth is not None else 30.0
+        gain_depth = 0.0
+    else:  # both
+        phase_depth = args.depth if args.depth is not None else 30.0
+        gain_depth = args.gain_depth if args.gain_depth is not None else 0.0
 
     # OSC output to harmonic_shaper
     osc_out = udp_client.SimpleUDPClient(args.shaper_ip, args.shaper_port)
@@ -535,7 +655,8 @@ def main():
         osc_out=osc_out,
         shaper_api=args.shaper_api,
         param_mode=args.param,
-        depth=args.depth,
+        phase_depth=phase_depth,
+        gain_depth=gain_depth,
         update_rate=args.update_rate,
         osc_rate=args.osc_rate,
         window_seconds=args.window,
@@ -546,10 +667,11 @@ def main():
     print(f"\n  Fetching base values from {args.shaper_api}...")
     bridge.refresh_base_values()
 
-    # OSC input from Muse 2
+    # OSC input (Muse 2 EEG + bridge control)
     disp = dispatcher.Dispatcher()
     disp.map("/muse/eeg", bridge.eeg_handler)
     disp.map("/muse/elements/horseshoe", bridge.horseshoe_handler)
+    disp.map("/bridge/gain_depth", bridge.gain_depth_handler)
     server = osc_server.ThreadingOSCUDPServer(("0.0.0.0", args.listen_port), disp)
 
     def signal_handler(sig, frame):
@@ -563,17 +685,19 @@ def main():
 
     # ─── Banner ───
     if args.param == "gain":
-        depth_label = f"+/-{int(args.depth * 100)}% of base gain"
         mode_label = "GAIN TILT"
+        depth_label = f"+/-{int(gain_depth * 100)}% of base gain"
         mode_desc = [
             "Tilt mapping (alpha/beta ratio):",
             "  Relaxed (alpha high) --> boost lower harmonics (warm)",
             "  Focused (beta high)  --> boost upper harmonics (bright)",
             f"  Weights: {TILT_WEIGHTS}",
+            "  /bridge/gain_depth OSC overrides depth in real-time",
         ]
-    else:
-        depth_label = f"0-{args.depth:.0f} deg/s max rotation"
+        param_path = "gain"
+    elif args.param == "phase":
         mode_label = "PHASE ROTATION"
+        depth_label = f"0-{phase_depth:.0f} deg/s max rotation"
         mode_desc = [
             "Per-band rotation (band power --> phase velocity):",
             "  H1: anchored (no rotation)",
@@ -582,8 +706,25 @@ def main():
             cfg = PHASE_SENSOR_MAP[n]
             mode_desc.append(f"  H{n}: {cfg['label']} --> rotation speed")
         mode_desc.append("  Stronger band activity = faster rotation")
+        param_path = "phase"
+    else:
+        mode_label = "PHASE + GAIN"
+        depth_label = f"phase: 0-{phase_depth:.0f} deg/s | gain: slider-controlled (init {int(gain_depth * 100)}%)"
+        mode_desc = [
+            "Phase rotation (band power --> velocity, interpolated):",
+            "  H1: anchored (no rotation)",
+        ]
+        for n in sorted(PHASE_SENSOR_MAP.keys()):
+            cfg = PHASE_SENSOR_MAP[n]
+            mode_desc.append(f"  H{n}: {cfg['label']} --> rotation speed")
+        mode_desc.append("")
+        mode_desc.append("Gain tilt (alpha/beta ratio, depth from slider):")
+        mode_desc.append(f"  Weights: {TILT_WEIGHTS}")
+        mode_desc.append("  Slider at 0% = gains untouched by EEG")
+        mode_desc.append("  Slider at 50% = EEG can swing gain +/-50% of base")
+        mode_desc.append("  Control: /bridge/gain_depth on this port (0-127 or 0.0-1.0)")
+        param_path = "phase+gain"
 
-    param_path = "gain" if args.param == "gain" else "phase"
     print(f"\n{'='*70}")
     print(f"  Muse Bridge [{mode_label}]")
     print(f"{'='*70}")
@@ -592,8 +733,8 @@ def main():
     print(f"  API:      {args.shaper_api}")
     print(f"  Depth:    {depth_label}")
     print(f"  EEG rate: {args.update_rate} Hz (analysis)")
-    if args.param == "phase":
-        print(f"  OSC rate: {args.osc_rate} Hz (interpolated output)")
+    if args.param in ("phase", "both"):
+        print(f"  OSC rate: {args.osc_rate} Hz (interpolated phase output)")
     print(f"  Window:   {args.window}s ({int(args.window * SAMPLING_RATE)} samples)")
     print(f"  Smooth:   alpha={args.smoothing}")
     print(f"")

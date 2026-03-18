@@ -41,6 +41,13 @@
     "window_seconds": 1.0,
     "tilt_weights": [-0.8, -0.4, 0.0, 0.4, 0.8]
   },
+  "midi_relay": {
+    "midi_port": null,
+    "cc_number": 1,
+    "target_ip": "127.0.0.1",
+    "target_port": 5000,
+    "osc_address": "/bridge/gain_depth"
+  },
   "muse2_positions": {
     "TP9":  [-0.0694, -0.0326, -0.0140],
     "AF7":  [-0.0482,  0.0566,  0.0274],
