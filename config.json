@@ -48,6 +48,16 @@
     "target_port": 5000,
     "osc_address": "/bridge/gain_depth"
   },
+  "hr_relay": {
+    "mode": "simulate",
+    "target_ip": "127.0.0.1",
+    "target_port": 5000,
+    "bpm": 72,
+    "variation": 3,
+    "scan_timeout": 10,
+    "poll_interval": 15,
+    "pulse_amplitude": 0.15
+  },
   "muse2_positions": {
     "TP9":  [-0.0694, -0.0326, -0.0140],
     "AF7":  [-0.0482,  0.0566,  0.0274],

@@ -58,7 +58,7 @@ def make_bridge(fake_osc):
     """Factory fixture: returns a function that creates a MuseBridge with sensible defaults."""
 
     def _make(param_mode="both", phase_depth=30.0, gain_depth=0.2,
-              update_rate=4.0, osc_rate=30.0, **kwargs):
+              update_rate=4.0, osc_rate=30.0, pulse_amplitude=0.15, **kwargs):
         bridge = MuseBridge(
             osc_out=fake_osc,
             shaper_api="http://127.0.0.1:9999",
@@ -67,6 +67,7 @@ def make_bridge(fake_osc):
             gain_depth=gain_depth,
             update_rate=update_rate,
             osc_rate=osc_rate,
+            pulse_amplitude=pulse_amplitude,
             **kwargs,
         )
         bridge.running = True

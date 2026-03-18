@@ -1,11 +1,12 @@
 """
 Test battery for muse_bridge.py
 
-Layer 1: Unit tests — pure math/logic (tilt, gain modulation, phase)
-Layer 2: Handler tests — OSC handlers, depth control, restore
-Layer 3: Integration — real UDP OSC with synthetic EEG
+Layer 1: Unit tests — pure math/logic (tilt, gain modulation, phase, heartbeat)
+Layer 2: Handler tests — OSC handlers, depth control, heartbeat triggers, restore
+Layer 3: Integration — real UDP OSC with synthetic EEG and heartbeat
 """
 
+import math
 import threading
 import time
 
@@ -232,8 +233,178 @@ class TestAdvancePhases:
 
 
 # ═══════════════════════════════════════════════
+# Layer 1: Unit Tests — Heartbeat Envelope
+# ═══════════════════════════════════════════════
+
+
+class TestHeartbeatEnvelope:
+    """Tests for compute_heartbeat_envelope and apply_heartbeat_pulse."""
+
+    def test_no_bpm_returns_zero(self, make_bridge):
+        bridge = make_bridge(pulse_amplitude=0.15)
+        assert bridge.current_bpm == 0.0
+        env = bridge.compute_heartbeat_envelope(0.033)
+        assert env == 0.0
+
+    def test_zero_amplitude_returns_zero(self, make_bridge):
+        bridge = make_bridge(pulse_amplitude=0.0)
+        bridge.current_bpm = 72.0
+        bridge.beat_phase = 0.0
+        env = bridge.compute_heartbeat_envelope(0.033)
+        assert env == 0.0
+
+    def test_peak_at_beat_onset(self, make_bridge):
+        """Immediately after a beat, envelope should be near pulse_amplitude."""
+        bridge = make_bridge(pulse_amplitude=0.15)
+        bridge.current_bpm = 72.0
+        bridge.beat_phase = 0.0
+        env = bridge.compute_heartbeat_envelope(0.001)
+        assert abs(env - 0.15) < 0.01, f"Expected ~0.15 at onset, got {env}"
+
+    def test_envelope_decays(self, make_bridge):
+        """Envelope should decrease over time after a beat."""
+        bridge = make_bridge(pulse_amplitude=0.15)
+        bridge.current_bpm = 72.0
+        bridge.beat_phase = 0.0
+
+        env_early = bridge.compute_heartbeat_envelope(0.01)
+        env_mid = bridge.compute_heartbeat_envelope(0.1)
+        env_late = bridge.compute_heartbeat_envelope(0.2)
+
+        assert env_early > env_mid > env_late, \
+            f"Envelope should decay: {env_early} > {env_mid} > {env_late}"
+
+    def test_decay_tau_scales_with_bpm(self, make_bridge):
+        """Higher BPM should have faster decay (shorter tau)."""
+        bridge_slow = make_bridge(pulse_amplitude=0.15)
+        bridge_slow.current_bpm = 60.0
+        bridge_slow.beat_phase = 0.0
+
+        bridge_fast = make_bridge(pulse_amplitude=0.15)
+        bridge_fast.current_bpm = 120.0
+        bridge_fast.beat_phase = 0.0
+
+        # Advance both by the same dt
+        bridge_slow.compute_heartbeat_envelope(0.001)
+        bridge_fast.compute_heartbeat_envelope(0.001)
+
+        # After 200ms, the 120 BPM envelope should have decayed more
+        env_slow = bridge_slow.compute_heartbeat_envelope(0.2)
+        env_fast = bridge_fast.compute_heartbeat_envelope(0.2)
+
+        assert env_slow > env_fast, \
+            f"60 BPM should have slower decay than 120 BPM: {env_slow} vs {env_fast}"
+
+    def test_envelope_near_zero_after_full_interval(self, make_bridge):
+        """By the time the next beat would arrive, envelope should be small."""
+        bridge = make_bridge(pulse_amplitude=0.15)
+        bridge.current_bpm = 72.0
+        bridge.beat_phase = 0.0
+        bridge.beat_triggered = True  # real-beat mode: no auto-retrigger
+
+        interval = 60.0 / 72.0  # ~0.833s
+        env = bridge.compute_heartbeat_envelope(interval)
+        assert env < 0.01, f"Envelope should be near zero after full interval, got {env}"
+
+    def test_bpm_synthesized_auto_retrigger(self, make_bridge):
+        """In BPM-synthesized mode, beat_phase wraps and re-triggers."""
+        bridge = make_bridge(pulse_amplitude=0.15)
+        bridge.current_bpm = 72.0
+        bridge.beat_triggered = False
+        bridge.beat_phase = 0.0
+
+        interval = 60.0 / 72.0
+        # Accumulate past one full interval
+        steps = int(interval / 0.033) + 2
+        for _ in range(steps):
+            env = bridge.compute_heartbeat_envelope(0.033)
+
+        # beat_phase should have wrapped (auto-retrigger)
+        assert bridge.beat_phase < interval, \
+            f"BPM-synth mode should auto-retrigger, beat_phase={bridge.beat_phase}"
+        # Envelope should be non-trivial after retrigger
+        env = bridge.compute_heartbeat_envelope(0.001)
+        assert env > 0.01, f"Expected some envelope after retrigger, got {env}"
+
+
+class TestApplyHeartbeatPulse:
+    """Tests for gain pulse multiplication."""
+
+    def test_no_pulse_returns_original(self, make_bridge):
+        bridge = make_bridge(pulse_amplitude=0.15)
+        bridge.current_bpm = 0.0
+        gains = {1: 0.5, 2: 0.6, 3: 0.7, 4: 0.8, 5: 0.9}
+        pulsed, env = bridge.apply_heartbeat_pulse(gains, 0.033)
+        assert env == 0.0
+        for n in gains:
+            assert pulsed[n] == gains[n]
+
+    def test_pulse_boosts_gains(self, make_bridge):
+        bridge = make_bridge(pulse_amplitude=0.15)
+        bridge.current_bpm = 72.0
+        bridge.beat_phase = 0.0
+
+        gains = {1: 0.5, 2: 0.6, 3: 0.7, 4: 0.8, 5: 0.9}
+        pulsed, env = bridge.apply_heartbeat_pulse(gains, 0.001)
+
+        assert env > 0.1
+        for n in gains:
+            assert pulsed[n] > gains[n], \
+                f"H{n}: pulse should boost gain ({pulsed[n]} should be > {gains[n]})"
+
+    def test_pulse_clamps_to_one(self, make_bridge):
+        bridge = make_bridge(pulse_amplitude=0.5)
+        bridge.current_bpm = 72.0
+        bridge.beat_phase = 0.0
+
+        gains = {1: 0.95, 2: 0.95, 3: 0.95, 4: 0.95, 5: 0.95}
+        pulsed, env = bridge.apply_heartbeat_pulse(gains, 0.001)
+
+        for n in gains:
+            assert pulsed[n] <= 1.0, f"H{n}: pulsed gain {pulsed[n]} exceeds 1.0"
+
+    def test_heartbeat_active_property(self, make_bridge):
+        bridge = make_bridge(pulse_amplitude=0.15)
+        assert not bridge.heartbeat_active
+
+        bridge.current_bpm = 72.0
+        assert bridge.heartbeat_active
+
+        bridge.pulse_amplitude = 0.0
+        assert not bridge.heartbeat_active
+
+
+# ═══════════════════════════════════════════════
 # Layer 2: Handler / Depth Control Tests
 # ═══════════════════════════════════════════════
+
+
+class TestHeartbeatHandler:
+    """Tests for /bridge/heartbeat and /bridge/heartbeat_bpm OSC handlers."""
+
+    def test_heartbeat_sets_bpm_and_resets_phase(self, make_bridge):
+        bridge = make_bridge()
+        bridge.beat_phase = 999.0
+        bridge.heartbeat_handler("/bridge/heartbeat", 72.0, 833.0)
+        assert bridge.current_bpm == 72.0
+        assert bridge.beat_phase == 0.0
+        assert bridge.beat_triggered is True
+
+    def test_heartbeat_bpm_only(self, make_bridge):
+        bridge = make_bridge()
+        bridge.heartbeat_bpm_handler("/bridge/heartbeat_bpm", 80.0)
+        assert bridge.current_bpm == 80.0
+        assert bridge.beat_triggered is False
+
+    def test_heartbeat_no_args_safe(self, make_bridge):
+        bridge = make_bridge()
+        bridge.heartbeat_handler("/bridge/heartbeat")
+        assert bridge.beat_phase == 0.0
+
+    def test_heartbeat_negative_bpm_clamped(self, make_bridge):
+        bridge = make_bridge()
+        bridge.heartbeat_handler("/bridge/heartbeat", -10.0)
+        assert bridge.current_bpm == 0.0
 
 
 class TestGainDepthHandler:
@@ -532,3 +703,92 @@ class TestIntegrationBothModeSlider:
         bridge.running = False
         in_server.shutdown()
         collector.stop()
+
+
+class TestIntegrationHeartbeatPulse:
+    """End-to-end: heartbeat OSC -> muse_bridge -> pulsed gain output."""
+
+    def test_heartbeat_produces_gain_pulses(self):
+        listen_port = _find_free_port()
+        output_port = _find_free_port()
+
+        collector = OSCCollector(output_port)
+        collector.start()
+
+        osc_out = udp_client.SimpleUDPClient("127.0.0.1", output_port)
+        bridge = MuseBridge(
+            osc_out=osc_out,
+            shaper_api="http://127.0.0.1:9999",
+            param_mode="gain",
+            phase_depth=0.0,
+            gain_depth=0.2,
+            update_rate=4.0,
+            osc_rate=30.0,
+            pulse_amplitude=0.15,
+        )
+        bridge.running = True
+        for ch in CHANNELS:
+            bridge.contact_quality[ch] = 1.0
+
+        # Fill buffer with alpha EEG
+        alpha_wave = make_sine_buffer(10.0, amplitude=80.0)
+        fill_bridge_buffers(bridge, {ch: alpha_wave for ch in CHANNELS})
+
+        # Compute baseline gains before heartbeat
+        baseline_gains = bridge.compute_gain_modulation()
+        bridge.current_tilt_gains = baseline_gains
+
+        # Simulate heartbeat trigger
+        bridge.heartbeat_handler("/bridge/heartbeat", 72.0, 833.0)
+        assert bridge.heartbeat_active
+
+        # Apply pulse
+        pulsed, env = bridge.apply_heartbeat_pulse(baseline_gains, 0.001)
+        bridge.send_gains(pulsed)
+
+        # Verify output arrived
+        assert collector.wait_for("/shaper/harmonic", count=5, timeout=3.0)
+
+        gain_msgs = [m for m in collector.get("/shaper/harmonic") if "/gain" in m[0]]
+        assert len(gain_msgs) >= 5
+
+        # Pulsed gains should be higher than baseline
+        for addr, args in gain_msgs:
+            n = int(addr.split("/")[3])
+            assert args[0] >= baseline_gains.get(n, 0.8) - 0.01, \
+                f"{addr}: pulsed gain {args[0]} should be >= baseline {baseline_gains.get(n)}"
+
+        collector.stop()
+
+    def test_bpm_synthesized_mode_triggers(self):
+        """BPM-only update should enable synthesized beats."""
+        bridge = MuseBridge(
+            osc_out=FakeOSCClient(),
+            shaper_api="http://127.0.0.1:9999",
+            param_mode="both",
+            phase_depth=30.0,
+            gain_depth=0.2,
+            update_rate=4.0,
+            osc_rate=30.0,
+            pulse_amplitude=0.15,
+        )
+        bridge.running = True
+
+        bridge.heartbeat_bpm_handler("/bridge/heartbeat_bpm", 72.0)
+        assert bridge.current_bpm == 72.0
+        assert bridge.beat_triggered is False
+        assert bridge.heartbeat_active
+
+        # Advance through one interval — envelope should auto-retrigger
+        interval = 60.0 / 72.0
+        total_time = 0.0
+        dt = 0.033
+        envelopes = []
+        while total_time < interval * 1.5:
+            env = bridge.compute_heartbeat_envelope(dt)
+            envelopes.append(env)
+            total_time += dt
+
+        # Should have seen at least one peak (from retrigger)
+        peak = max(envelopes)
+        assert peak > 0.05, f"Expected envelope peak from retrigger, max was {peak}"

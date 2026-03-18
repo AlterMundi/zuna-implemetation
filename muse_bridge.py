@@ -4,7 +4,12 @@ Muse Bridge — EEG-driven parameter modulation for the Harmonic Shaper
 Reads live Muse 2 EEG via OSC and modulates harmonic_shaper parameters
 within bounded limits around the user-set base values.
 
-Three parameter modes (--param):
+Every input is independent and optional.  If no Muse 2 is streaming,
+nothing happens.  If no hr_relay is running, there is no heartbeat
+pulse.  If no Launchpad slider sends /bridge/gain_depth, gain depth
+stays at its initial CLI value.  Mix and match freely.
+
+Parameter modes (--param):
 
   gain   — Spectral tilt: alpha/beta ratio tilts the gain curve.
            Relaxation boosts lower harmonics, focus boosts upper.
@@ -22,25 +27,49 @@ Three parameter modes (--param):
            midi_relay.py). Slider at 0 = no gain modulation.
            Slider at max = full EEG influence on gains.
 
+Heartbeat pulse (--pulse, optional):
+  When hr_relay.py sends /bridge/heartbeat or /bridge/heartbeat_bpm,
+  a short exponential gain envelope fires on each beat, creating a
+  visible "breathing" in the cymatic pattern.  Works in any param mode.
+  Set --pulse 0 to disable.  Runs at osc_rate for smooth rendering.
+
+Session configurations:
+
+  # 1. Muse-only: phase control
+  python muse_bridge.py --param phase --depth 30
+
+  # 2. Muse-only: gain tilt
+  python muse_bridge.py --param gain --depth 0.20
+
+  # 3. Muse phase + Launchpad gain (slider controls EEG gain depth)
+  python midi_relay.py --target-port 5000 &
+  python muse_bridge.py --param both --depth 30
+
+  # 4. Muse phase + Fitbit gain pulse (no EEG gain, heartbeat only)
+  python hr_relay.py --mode simulate --bpm 72 &
+  python muse_bridge.py --param phase --depth 30
+
+  # 5. All three: Muse phase + Launchpad gain + Fitbit pulse
+  python midi_relay.py --target-port 5000 &
+  python hr_relay.py --mode ble &
+  python muse_bridge.py --param both --depth 30
+
+  # 6. Fitbit pulse only (no Muse, no Launchpad)
+  python hr_relay.py --mode simulate --bpm 72 &
+  python muse_bridge.py --param phase --depth 0
+
+  # 7. Test without any hardware
+  python simulate_eeg.py &
+  python hr_relay.py --mode simulate --bpm 72 &
+  python muse_bridge.py --param both --depth 30
+
 Base values are fetched from harmonic_shaper's HTTP API on startup.
-On exit, base values are restored.
-
-Usage:
-    python muse_bridge.py --param gain --depth 0.20
-    python muse_bridge.py --param phase --depth 30 --osc-rate 60
-    python muse_bridge.py --param both --depth 30
-    python muse_bridge.py --param both --depth 30 --gain-depth 0.20
-
-    # With Launchpad slider control (run alongside):
-    python midi_relay.py --target-port 5000
-
-Test with the EEG simulator (no Muse 2 needed):
-    python simulate_eeg.py &
-    python muse_bridge.py --param both
+On exit, all modified parameters are restored to their base values.
 """
 
 import argparse
 import json
+import math
 import signal
 import sys
 import time
@@ -115,7 +144,7 @@ class MuseBridge:
 
     def __init__(self, osc_out, shaper_api, param_mode, phase_depth, gain_depth,
                  update_rate, osc_rate=30.0, window_seconds=1.0,
-                 smoothing_alpha=0.25):
+                 smoothing_alpha=0.25, pulse_amplitude=0.15):
         self.osc_out = osc_out
         self.shaper_api = shaper_api
         self.param_mode = param_mode
@@ -145,12 +174,20 @@ class MuseBridge:
         # Gain tilt state
         self.tilt_smooth = 0.0
         self.last_gains_sent = {}
+        self.current_tilt_gains = {}
 
         # Phase rotation state
         self.phase_accumulators = {n: 0.0 for n in range(1, 6)}
         self.phase_velocities = {n: 0.0 for n in range(1, 6)}
         self.power_history = {ch: [] for ch in CHANNELS}
         self.last_phases_sent = {}
+
+        # Heartbeat state
+        self.pulse_amplitude = pulse_amplitude
+        self.current_bpm = 0.0
+        self.beat_phase = 999.0          # seconds since last beat (high = no pulse)
+        self.beat_triggered = False      # True = real beats from BLE
+        self.last_envelope = 0.0
 
         self._lock = threading.Lock()
         self.updates_sent = 0
@@ -215,6 +252,23 @@ class MuseBridge:
         if raw > 1.0:
             raw = raw / 127.0
         self.gain_depth = max(0.0, min(1.0, raw))
+
+    def heartbeat_handler(self, address, *args):
+        """Beat event from BLE or simulated source. Args: [bpm] or [bpm, rr_ms]."""
+        if args:
+            self.current_bpm = max(0.0, float(args[0]))
+        self.beat_phase = 0.0
+        self.beat_triggered = True
+
+    def heartbeat_bpm_handler(self, address, *args):
+        """BPM-only update from Fitbit Web API. Args: [bpm].
+
+        Triggers local beat synthesis — the bridge generates the beat
+        clock internally from the BPM value.
+        """
+        if args:
+            self.current_bpm = max(0.0, float(args[0]))
+        self.beat_triggered = False
 
     # ─── Analysis Helpers ───
 
@@ -336,6 +390,47 @@ class MuseBridge:
 
         return phases
 
+    # ─── Heartbeat Pulse ───
+
+    def compute_heartbeat_envelope(self, dt):
+        """Advance beat phase and return current envelope amplitude.
+
+        In beat-triggered mode (BLE/simulate), beat_phase is reset to 0
+        by the OSC handler on each beat.
+        In BPM-synthesized mode (Web API), the local clock triggers beats.
+        """
+        if self.current_bpm < 1.0 or self.pulse_amplitude < 0.001:
+            return 0.0
+
+        self.beat_phase += dt
+
+        if not self.beat_triggered:
+            beat_interval = 60.0 / self.current_bpm
+            if self.beat_phase >= beat_interval:
+                self.beat_phase %= beat_interval
+
+        # Auto-scale decay so pulses don't overlap
+        decay_tau = 0.3 * (60.0 / self.current_bpm)
+        self.last_envelope = self.pulse_amplitude * math.exp(-self.beat_phase / decay_tau)
+        return self.last_envelope
+
+    def apply_heartbeat_pulse(self, gains, dt):
+        """Apply heartbeat gain pulse on top of existing gains.
+
+        Returns (pulsed_gains, envelope_value).
+        """
+        envelope = self.compute_heartbeat_envelope(dt)
+        if envelope < 0.001:
+            return gains, 0.0
+        pulsed = {}
+        for n, g in gains.items():
+            pulsed[n] = float(np.clip(g * (1.0 + envelope), 0.0, 1.0))
+        return pulsed, envelope
+
+    @property
+    def heartbeat_active(self):
+        return self.current_bpm >= 1.0 and self.pulse_amplitude >= 0.001
+
     # ─── OSC Output ───
 
     def send_gains(self, gains):
@@ -349,8 +444,12 @@ class MuseBridge:
         self.last_phases_sent = phases
 
     def restore_base(self):
-        """Restore base values before exiting."""
-        if self.param_mode in ("gain", "both"):
+        """Restore base values before exiting.
+
+        Always restores gains if heartbeat was active, since the pulse
+        modifies gains regardless of param_mode.
+        """
+        if self.param_mode in ("gain", "both") or self.heartbeat_active:
             self.send_gains(self.base_gains)
         if self.param_mode in ("phase", "both"):
             self.send_phases(self.base_phases)
@@ -426,6 +525,11 @@ class MuseBridge:
             bar = "\u2588" * fill + "\u2591" * (bar_w - fill)
             sign = "+" if delta >= 0 else ""
             parts.append(f"H{n}[{bar}]{g:.2f}({sign}{delta:.2f})")
+
+        if self.heartbeat_active:
+            beat_icon = "\u2665" if self.last_envelope > self.pulse_amplitude * 0.3 else "\u2661"
+            parts.append(f"{beat_icon}{self.current_bpm:.0f}bpm")
+
         return "  " + "  ".join(parts)
 
     def _format_phase_status(self, result):
@@ -456,6 +560,10 @@ class MuseBridge:
             cfg = PHASE_SENSOR_MAP.get(n, {})
             band_label = cfg.get("band", "---")[:3] if n > 1 else "anc"
             parts.append(f"H{n} {speed_icon} {ph:5.1f}\u00b0({offset:+.0f}\u00b0) {vel:4.1f}\u00b0/s {band_label}")
+
+        if self.heartbeat_active:
+            beat_icon = "\u2665" if self.last_envelope > self.pulse_amplitude * 0.3 else "\u2661"
+            parts.append(f"{beat_icon}{self.current_bpm:.0f}bpm")
 
         return "  " + "  ".join(parts)
 
@@ -491,7 +599,14 @@ class MuseBridge:
                 g_parts = [f"H{n}={g:.2f}" for n, g in sorted(gains.items())]
                 gain_str += " " + " ".join(g_parts)
 
-        return f"  {phase_str} | {gain_str}"
+        # Heartbeat indicator
+        if self.heartbeat_active:
+            beat_icon = "\u2665" if self.last_envelope > self.pulse_amplitude * 0.3 else "\u2661"
+            hr_str = f" {beat_icon}{self.current_bpm:.0f}bpm"
+        else:
+            hr_str = ""
+
+        return f"  {phase_str} | {gain_str}{hr_str}"
 
     # ─── Loop ───
 
@@ -504,12 +619,45 @@ class MuseBridge:
             self._run_both_loop()
 
     def _run_gain_loop(self):
-        """Gain mode: single-rate loop at update_rate."""
+        """Gain mode: dual-rate when heartbeat active, single-rate otherwise."""
+        ticks_per_analysis = max(1, int(round(self.osc_rate / self.update_rate)))
+        display_every = max(1, int(round(self.osc_rate / 4.0)))
+        tick = 0
+        last_result = None
+
         while self.running:
-            result = self.update_gain()
-            status = self.format_status(result)
-            print(f"\r{status}  [{self.updates_sent}]", end="", flush=True)
-            time.sleep(self.update_interval)
+            t0 = time.monotonic()
+            buffering = self.samples_received < self.window_size // 2
+
+            if tick % ticks_per_analysis == 0 and not buffering:
+                if self._has_good_frontal():
+                    gains = self.compute_gain_modulation()
+                    self.current_tilt_gains = gains
+                    if not self.heartbeat_active:
+                        self.send_gains(gains)
+                    self.updates_sent += 1
+                    last_result = {"tilt": self.tilt_smooth, "gains": gains}
+                elif last_result is None:
+                    last_result = {"status": "no_signal"}
+
+            # Heartbeat pulse: send pulsed gains at osc_rate
+            if self.heartbeat_active and self.current_tilt_gains:
+                pulsed, env = self.apply_heartbeat_pulse(self.current_tilt_gains, self.osc_interval)
+                self.send_gains(pulsed)
+                self.osc_sends += 1
+                if last_result and last_result.get("gains"):
+                    last_result["gains"] = pulsed
+
+            if tick % display_every == 0:
+                status = self.format_status(last_result)
+                suffix = f"  [a:{self.updates_sent} o:{self.osc_sends}]" if self.heartbeat_active else f"  [{self.updates_sent}]"
+                print(f"\r{status}{suffix}", end="", flush=True)
+
+            tick += 1
+            elapsed = time.monotonic() - t0
+            sleep_for = self.osc_interval - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
     def _run_phase_loop(self):
         """Phase mode: dual-rate loop.
@@ -517,6 +665,7 @@ class MuseBridge:
         Outer clock runs at osc_rate (30 Hz default) for smooth phase
         interpolation. EEG analysis runs every analysis_every ticks
         (update_rate / osc_rate ratio).
+        When heartbeat is active, gain pulses are overlaid on base gains.
         """
         ticks_per_analysis = max(1, int(round(self.osc_rate / self.update_rate)))
         display_every = max(1, int(round(self.osc_rate / 4.0)))
@@ -538,6 +687,11 @@ class MuseBridge:
                     phase_result = self.tick_phase_output(self.osc_interval)
                     last_result = phase_result
 
+            # Heartbeat pulse on base gains (no EEG tilt in phase-only mode)
+            if self.heartbeat_active:
+                pulsed, env = self.apply_heartbeat_pulse(self.base_gains, self.osc_interval)
+                self.send_gains(pulsed)
+
             if tick % display_every == 0:
                 status = self.format_status(last_result)
                 print(f"\r{status}  [a:{self.updates_sent} o:{self.osc_sends}]", end="", flush=True)
@@ -553,6 +707,7 @@ class MuseBridge:
 
         Gain depth is dynamic — controlled by /bridge/gain_depth OSC from
         the Launchpad slider via midi_relay.py.
+        Heartbeat pulse overlays on gains at osc_rate when active.
         """
         ticks_per_analysis = max(1, int(round(self.osc_rate / self.update_rate)))
         display_every = max(1, int(round(self.osc_rate / 4.0)))
@@ -565,15 +720,16 @@ class MuseBridge:
             buffering = self.samples_received < self.window_size // 2
 
             if tick % ticks_per_analysis == 0 and not buffering:
-                # Analysis tick: update phase velocities + gain tilt
                 if self._has_any_good_channel():
                     self.analyze_phase_velocities()
                     phase_active = True
                     self.updates_sent += 1
 
-                if self.gain_depth > 0.001 and self._has_good_frontal():
+                if (self.gain_depth > 0.001 or self.heartbeat_active) and self._has_good_frontal():
                     gains = self.compute_gain_modulation()
-                    self.send_gains(gains)
+                    self.current_tilt_gains = gains
+                    if not self.heartbeat_active:
+                        self.send_gains(gains)
                     if last_result is None:
                         last_result = {}
                     last_result["tilt"] = self.tilt_smooth
@@ -586,6 +742,15 @@ class MuseBridge:
                     last_result = {}
                 last_result["phases"] = phase_result["phases"]
                 last_result["velocities"] = phase_result["velocities"]
+
+            # Heartbeat pulse on gains at osc_rate
+            if self.heartbeat_active:
+                source = self.current_tilt_gains if self.current_tilt_gains else self.base_gains
+                pulsed, env = self.apply_heartbeat_pulse(source, self.osc_interval)
+                self.send_gains(pulsed)
+                if last_result is None:
+                    last_result = {}
+                last_result["gains"] = pulsed
 
             if tick % display_every == 0:
                 status = self.format_status(last_result)
@@ -634,6 +799,9 @@ def main():
     parser.add_argument("--smoothing", type=float,
                         default=MB.get("smoothing_alpha", 0.25),
                         help="EMA smoothing factor 0-1 (default: 0.25)")
+    parser.add_argument("--pulse", type=float,
+                        default=MB.get("pulse_amplitude", 0.15),
+                        help="Heartbeat pulse amplitude 0-1 (default: 0.15, 0=disabled)")
     args = parser.parse_args()
 
     # Resolve depths per mode
@@ -661,6 +829,7 @@ def main():
         osc_rate=args.osc_rate,
         window_seconds=args.window,
         smoothing_alpha=args.smoothing,
+        pulse_amplitude=args.pulse,
     )
 
     # Fetch base values from shaper
@@ -672,6 +841,8 @@ def main():
     disp.map("/muse/eeg", bridge.eeg_handler)
     disp.map("/muse/elements/horseshoe", bridge.horseshoe_handler)
     disp.map("/bridge/gain_depth", bridge.gain_depth_handler)
+    disp.map("/bridge/heartbeat", bridge.heartbeat_handler)
+    disp.map("/bridge/heartbeat_bpm", bridge.heartbeat_bpm_handler)
     server = osc_server.ThreadingOSCUDPServer(("0.0.0.0", args.listen_port), disp)
 
     def signal_handler(sig, frame):
@@ -737,6 +908,9 @@ def main():
         print(f"  OSC rate: {args.osc_rate} Hz (interpolated phase output)")
     print(f"  Window:   {args.window}s ({int(args.window * SAMPLING_RATE)} samples)")
     print(f"  Smooth:   alpha={args.smoothing}")
+    if args.pulse > 0:
+        print(f"  Pulse:    {int(args.pulse * 100)}% gain boost per heartbeat")
+        print(f"            /bridge/heartbeat or /bridge/heartbeat_bpm on this port")
     print(f"")
     for line in mode_desc:
         print(f"  {line}")
